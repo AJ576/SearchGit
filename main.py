@@ -1,0 +1,164 @@
+"""Throwaway console harness for poking at the index.
+
+Hardcoded to physics_engine.git for now -- the indexer itself takes any path.
+"""
+
+import sys
+
+from repo_indexer import DELETED, RepoIndexer
+
+REPO = "physics_engine.git"
+
+HELP = """
+commands (<commit> defaults to HEAD, short shas ok)
+
+  files [commit]           every path at that commit, read from git
+  blob <path> [commit]     blob sha for one path at that commit
+  cat <path> [commit]      the file's actual contents at that commit
+  changes <path>           commits where that path changed, from the index
+  paths                    every path the index has ever seen
+  log [n]                  n most recent commits (default 10)
+  stats                    index size
+  help                     this
+  quit                     done
+"""
+
+
+def short(sha):
+    return sha.decode()[:8] if isinstance(sha, bytes) else str(sha)[:8]
+
+
+def subject(commit):
+    lines = commit.message.decode(errors="replace").splitlines()
+    return lines[0] if lines else ""
+
+
+def show(path):
+    return path.decode(errors="replace")
+
+
+class Harness:
+    def __init__(self, path):
+        self.ix = RepoIndexer()
+        self.ix.index_repo(path)
+        self.repo = self.ix.get_repo(path)
+        self.head = self.repo.head()
+
+    # --- helpers ----------------------------------------------------------
+
+    def resolve(self, ref):
+        """A short sha, a full sha, or None/HEAD -> a full commit sha."""
+        if ref is None or ref.upper() == "HEAD":
+            return self.head
+        want = ref.lower().encode()
+        hits = [c for c in self.ix.commit_repo if c.startswith(want)]
+        if len(hits) == 1:
+            return hits[0]
+        if not hits:
+            raise ValueError(f"no indexed commit starts with {ref!r}")
+        raise ValueError(f"{ref!r} is ambiguous: {', '.join(short(h) for h in hits)}")
+
+    # --- commands ---------------------------------------------------------
+
+    def cmd_files(self, commit=None):
+        sha = self.resolve(commit)
+        snap = self.ix.snapshot_at(sha)
+        for path in sorted(snap):
+            print(f"  {short(snap[path])}  {show(path)}")
+        print(f"{len(snap)} files at {short(sha)}")
+
+    def cmd_blob(self, path, commit=None):
+        sha = self.resolve(commit)
+        blob = self.ix.blob_at(sha, path)
+        if blob is DELETED:
+            # V0 cannot tell apart absent / directory / submodule
+            print(f"  {path} is not a file at {short(sha)}")
+        else:
+            print(f"  {blob.decode()}")
+
+    def cmd_cat(self, path, commit=None):
+        sha = self.resolve(commit)
+        blob = self.ix.blob_at(sha, path)
+        if blob is DELETED:
+            print(f"  {path} is not a file at {short(sha)}")
+            return
+        print(self.repo[blob].data.decode(errors="replace"))
+
+    def cmd_changes(self, path):
+        rows = self.ix.changes_to(path)
+        if not rows:
+            print(f"  no recorded changes to {path}")
+            return
+        for commit_sha, blob_sha in rows:
+            what = "DELETED " if blob_sha is DELETED else short(blob_sha) + " "
+            commit = self.repo[commit_sha]
+            # merges are not flagged yet, so some of these rows are a merge
+            # differing from its first parent rather than a real edit
+            print(f"  {short(commit_sha)}  {what} {subject(commit)[:46]}")
+        print(f"{len(rows)} changes to {path}")
+
+    def cmd_paths(self):
+        rows = sorted(self.ix.paths())
+        for path in rows:
+            n = len(self.ix.changes_to(path))
+            print(f"  {n:4}  {show(path)}")
+        print(f"{len(rows)} paths")
+
+    def cmd_log(self, n="10"):
+        for entry in list(self.repo.get_walker())[: int(n)]:
+            print(f"  {short(entry.commit.id)}  {subject(entry.commit)[:60]}")
+
+    def cmd_stats(self):
+        print(f"  repos indexed:  {self.ix.repos_indexed}")
+        print(f"  commits:        {len(self.ix.commit_repo)}")
+        print(f"  delta entries:  {len(self.ix.file_index)}")
+        print(f"  paths tracked:  {len(self.ix.paths())}")
+        print(f"  trees cached:   {len(self.ix.tree_cache)}")
+
+
+def main():
+    h = Harness(REPO)
+    print(HELP)
+
+    table = {
+        "files": h.cmd_files,
+        "blob": h.cmd_blob,
+        "cat": h.cmd_cat,
+        "changes": h.cmd_changes,
+        "paths": h.cmd_paths,
+        "log": h.cmd_log,
+        "stats": h.cmd_stats,
+    }
+
+    while True:
+        try:
+            line = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not line:
+            continue
+
+        cmd, *args = line.split()
+        if cmd in ("quit", "exit", "q"):
+            break
+        if cmd in ("help", "?"):
+            print(HELP)
+            continue
+
+        fn = table.get(cmd)
+        if fn is None:
+            print(f"  unknown command {cmd!r} -- try 'help'")
+            continue
+        try:
+            fn(*args)
+        except TypeError:
+            print(f"  wrong number of arguments for {cmd!r} -- try 'help'")
+        except (ValueError, KeyError) as e:
+            print(f"  {e}")
+
+    h.ix.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

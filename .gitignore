@@ -1,0 +1,28 @@
+# Bare repos we clone to index. These are other people's git history -- they
+# are our *input data*, not our source. Never commit a .git inside our .git.
+*.git/
+repos/
+corpus/
+
+# Build artifacts of the index itself
+*.sqlite
+*.sqlite3
+*.db
+index/
+*.trigrams
+*.bitmap
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/

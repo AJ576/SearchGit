@@ -3,9 +3,12 @@
 Hardcoded to physics_engine.git for now -- the indexer itself takes any path.
 """
 
+import inspect
 import sys
 
-from repo_indexer import DELETED, RepoIndexer
+from indexer import Indexer
+from reader import Reader
+from store import DELETED, Store
 
 REPO = "physics_engine.git"
 
@@ -70,9 +73,11 @@ class Harness:
         Args:
             path (str): File system path to the Git repository to index.
         """
-        self.ix = RepoIndexer()
-        self.ix.index_repo(path)
-        self.repo = self.ix.get_repo(path)
+        self.store = Store()
+        self.indexer = Indexer(self.store)
+        self.reader = Reader(self.store)
+        self.indexer.index_repo(path)
+        self.repo = self.store.get_repo(path)
         self.head = self.repo.head()
 
     # --- helpers ----------------------------------------------------------
@@ -95,7 +100,7 @@ class Harness:
         if ref is None or ref.upper() == "HEAD":
             return self.head
         want = ref.lower().encode()
-        hits = [c for c in self.ix.commit_repo if c.startswith(want)]
+        hits = [c for c in self.store.commit_repo if c.startswith(want)]
         if len(hits) == 1:
             return hits[0]
         if not hits:
@@ -111,7 +116,7 @@ class Harness:
             commit (str, optional): Commit reference or None (defaults to HEAD).
         """
         sha = self.resolve(commit)
-        snap = self.ix.snapshot_at(sha)
+        snap = self.reader.snapshot_at(sha)
         for path in sorted(snap):
             print(f"  {short(snap[path])}  {show(path)}")
         print(f"{len(snap)} files at {short(sha)}")
@@ -124,7 +129,7 @@ class Harness:
             commit (str, optional): Commit reference or None (defaults to HEAD).
         """
         sha = self.resolve(commit)
-        blob = self.ix.blob_at(sha, path)
+        blob = self.reader.blob_at(sha, path)
         if blob is DELETED:
             # V0 cannot tell apart absent / directory / submodule
             print(f"  {path} is not a file at {short(sha)}")
@@ -139,7 +144,7 @@ class Harness:
             commit (str, optional): Commit reference or None (defaults to HEAD).
         """
         sha = self.resolve(commit)
-        blob = self.ix.blob_at(sha, path)
+        blob = self.reader.blob_at(sha, path)
         if blob is DELETED:
             print(f"  {path} is not a file at {short(sha)}")
             return
@@ -151,7 +156,7 @@ class Harness:
         Args:
             path (str): Relative file path whose change history to look up.
         """
-        rows = self.ix.changes_to(path)
+        rows = self.reader.changes_to(path)
         if not rows:
             print(f"  no recorded changes to {path}")
             return
@@ -165,9 +170,9 @@ class Harness:
 
     def cmd_paths(self):
         """Command 'paths': lists all paths ever indexed and the count of commits touching each."""
-        rows = sorted(self.ix.paths())
+        rows = sorted(self.reader.paths())
         for path in rows:
-            n = len(self.ix.changes_to(path))
+            n = len(self.reader.changes_to(path))
             print(f"  {n:4}  {show(path)}")
         print(f"{len(rows)} paths")
 
@@ -177,16 +182,16 @@ class Harness:
         Args:
             n (str): Number of commits to show (default '10').
         """
-        for entry in list(self.repo.get_walker())[: int(n)]:
+        for entry in self.repo.get_walker(max_entries=int(n)):
             print(f"  {short(entry.commit.id)}  {subject(entry.commit)[:60]}")
 
     def cmd_stats(self):
         """Command 'stats': displays index size metrics and cache counts."""
-        print(f"  repos indexed:  {self.ix.repos_indexed}")
-        print(f"  commits:        {len(self.ix.commit_repo)}")
-        print(f"  delta entries:  {len(self.ix.file_index)}")
-        print(f"  paths tracked:  {len(self.ix.paths())}")
-        print(f"  trees cached:   {len(self.ix.tree_cache)}")
+        print(f"  repos indexed:  {len(self.store.indexed_repos)}")
+        print(f"  commits:        {len(self.store.commit_repo)}")
+        print(f"  delta entries:  {len(self.store.file_index)}")
+        print(f"  paths tracked:  {len(self.reader.paths())}")
+        print(f"  trees cached:   {len(self.store.tree_cache)}")
 
 
 def main():
@@ -224,14 +229,19 @@ def main():
         if fn is None:
             print(f"  unknown command {cmd!r} -- try 'help'")
             continue
+        # check arity up front so a TypeError raised *inside* a command
+        # surfaces as a real traceback instead of a usage message
         try:
-            fn(*args)
+            inspect.signature(fn).bind(*args)
         except TypeError:
             print(f"  wrong number of arguments for {cmd!r} -- try 'help'")
+            continue
+        try:
+            fn(*args)
         except (ValueError, KeyError) as e:
             print(f"  {e}")
 
-    h.ix.close()
+    h.store.close()
 
 
 if __name__ == "__main__":

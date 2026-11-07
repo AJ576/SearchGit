@@ -73,7 +73,9 @@ duplicates the other.
 ## What's here in V0
 
 ```
-repo_indexer.py   RepoIndexer -- the tree-diffing delta indexer
+store.py          Store -- repo handles, the in-memory delta index, tree cache
+indexer.py        Indexer -- write path: tree-diffs commits into the Store
+reader.py         Reader -- read path: snapshots/blobs from git, history from the Store
 main.py           console harness, hardcoded to physics_engine.git
 learn.py          scratch file from working out the dulwich API
 ```

@@ -25,20 +25,51 @@ commands (<commit> defaults to HEAD, short shas ok)
 
 
 def short(sha):
+    """Returns an 8-character prefix of a SHA hash for compact display.
+
+    Args:
+        sha (bytes | str): The Git object SHA (either binary or string).
+
+    Returns:
+        str: The first 8 characters of the hex SHA.
+    """
     return sha.decode()[:8] if isinstance(sha, bytes) else str(sha)[:8]
 
 
 def subject(commit):
+    """Extracts the first line (subject line) of a Git commit message.
+
+    Args:
+        commit (Commit): Dulwich Commit object.
+
+    Returns:
+        str: First line of the commit message, decoded with replacement characters.
+    """
     lines = commit.message.decode(errors="replace").splitlines()
     return lines[0] if lines else ""
 
 
 def show(path):
-    return path.decode(errors="replace")
+    """Safely decodes a raw filepath into a printable string.
+
+    Args:
+        path (bytes | str): File path as bytes or str.
+
+    Returns:
+        str: Decoded string representation of the path.
+    """
+    return path.decode(errors="replace") if isinstance(path, bytes) else str(path)
 
 
 class Harness:
+    """Console test harness that provides interactive commands over the index."""
+
     def __init__(self, path):
+        """Initializes the harness, indexes the repository, and caches HEAD.
+
+        Args:
+            path (str): File system path to the Git repository to index.
+        """
         self.ix = RepoIndexer()
         self.ix.index_repo(path)
         self.repo = self.ix.get_repo(path)
@@ -47,7 +78,20 @@ class Harness:
     # --- helpers ----------------------------------------------------------
 
     def resolve(self, ref):
-        """A short sha, a full sha, or None/HEAD -> a full commit sha."""
+        """Resolves a user-provided commit reference to a full commit SHA in bytes.
+
+        Accepts None, 'HEAD', a short SHA prefix, or a full SHA. Searches
+        indexed commits for a matching prefix.
+
+        Args:
+            ref (str | None): Commit reference entered by the user.
+
+        Returns:
+            bytes: Full 40-character commit SHA in bytes.
+
+        Raises:
+            ValueError: If no commit matches or if the prefix is ambiguous.
+        """
         if ref is None or ref.upper() == "HEAD":
             return self.head
         want = ref.lower().encode()
@@ -61,6 +105,11 @@ class Harness:
     # --- commands ---------------------------------------------------------
 
     def cmd_files(self, commit=None):
+        """Command 'files [commit]': prints all file paths and blob SHAs at a commit.
+
+        Args:
+            commit (str, optional): Commit reference or None (defaults to HEAD).
+        """
         sha = self.resolve(commit)
         snap = self.ix.snapshot_at(sha)
         for path in sorted(snap):
@@ -68,6 +117,12 @@ class Harness:
         print(f"{len(snap)} files at {short(sha)}")
 
     def cmd_blob(self, path, commit=None):
+        """Command 'blob <path> [commit]': prints the blob SHA of a specific file.
+
+        Args:
+            path (str): Relative file path within the repository.
+            commit (str, optional): Commit reference or None (defaults to HEAD).
+        """
         sha = self.resolve(commit)
         blob = self.ix.blob_at(sha, path)
         if blob is DELETED:
@@ -77,6 +132,12 @@ class Harness:
             print(f"  {blob.decode()}")
 
     def cmd_cat(self, path, commit=None):
+        """Command 'cat <path> [commit]': displays file contents at a given commit.
+
+        Args:
+            path (str): Relative file path to display.
+            commit (str, optional): Commit reference or None (defaults to HEAD).
+        """
         sha = self.resolve(commit)
         blob = self.ix.blob_at(sha, path)
         if blob is DELETED:
@@ -85,6 +146,11 @@ class Harness:
         print(self.repo[blob].data.decode(errors="replace"))
 
     def cmd_changes(self, path):
+        """Command 'changes <path>': lists commits where a specific file was modified or deleted.
+
+        Args:
+            path (str): Relative file path whose change history to look up.
+        """
         rows = self.ix.changes_to(path)
         if not rows:
             print(f"  no recorded changes to {path}")
@@ -98,6 +164,7 @@ class Harness:
         print(f"{len(rows)} changes to {path}")
 
     def cmd_paths(self):
+        """Command 'paths': lists all paths ever indexed and the count of commits touching each."""
         rows = sorted(self.ix.paths())
         for path in rows:
             n = len(self.ix.changes_to(path))
@@ -105,10 +172,16 @@ class Harness:
         print(f"{len(rows)} paths")
 
     def cmd_log(self, n="10"):
+        """Command 'log [n]': prints the N most recent commits (default 10) in reverse date order.
+
+        Args:
+            n (str): Number of commits to show (default '10').
+        """
         for entry in list(self.repo.get_walker())[: int(n)]:
             print(f"  {short(entry.commit.id)}  {subject(entry.commit)[:60]}")
 
     def cmd_stats(self):
+        """Command 'stats': displays index size metrics and cache counts."""
         print(f"  repos indexed:  {self.ix.repos_indexed}")
         print(f"  commits:        {len(self.ix.commit_repo)}")
         print(f"  delta entries:  {len(self.ix.file_index)}")
@@ -117,6 +190,7 @@ class Harness:
 
 
 def main():
+    """Runs the interactive REPL loop, parsing commands and dispatching them to Harness."""
     h = Harness(REPO)
     print(HELP)
 

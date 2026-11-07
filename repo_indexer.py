@@ -24,6 +24,7 @@ class RepoIndexer:
     """
 
     def __init__(self):
+        """Initializes the indexer with empty delta stores and repo caches."""
         # (commit_sha, filepath) -> blob_sha, or DELETED
         # only present when the path changed at that commit
         self.file_index = {}
@@ -44,11 +45,24 @@ class RepoIndexer:
 
     @property
     def repos_indexed(self):
+        """Returns the total number of distinct repositories indexed."""
         return len(self.indexed_repos)
 
     # --- indexing ----------------------------------------------------------
 
     def index_repo(self, path: str):
+        """Indexes all commits of a repository into delta and path-change maps.
+
+        Walks the repository's commit graph in topological/chronological order.
+        For each commit:
+          1. Identifies the root tree of its first parent (if any).
+          2. Diffs the parent tree against the commit's tree using `_diff_trees`.
+          3. Stores delta records `(sha, filepath) -> blob_sha` in `self.file_index`.
+          4. Appends `(sha, blob_sha)` to `self.path_changes` for fast file-history lookups.
+
+        Args:
+            path (str): File system path to the bare or non-bare Git repository.
+        """
         # realpath so the scope key is canonical -- "x.git" and "./x.git" are
         # the same repo and must not become two scopes
         key = os.path.realpath(path)
@@ -80,12 +94,19 @@ class RepoIndexer:
         print(f"  delta entries: {entry_count}")
 
     def _parent_tree(self, repo, commit):
-        """Root tree of the first parent, or None.
+        """Finds the root tree SHA of a commit's first parent, or None.
 
-        None also covers a shallow clone, whose boundary commit has a parent
-        sha whose object was never fetched. Treating that as "no parent" makes
-        the boundary a full snapshot, which is the honest answer -- we cannot
-        know what changed there.
+        None also covers root commits (no parents) and shallow clones, whose boundary
+        commit has a parent SHA whose object was never fetched. Treating that as
+        "no parent" makes the boundary a full snapshot, which is the honest answer --
+        we cannot know what changed there.
+
+        Args:
+            repo (Repo): An open Dulwich repository object.
+            commit (Commit): The commit object being examined.
+
+        Returns:
+            bytes | None: The 40-byte SHA of the parent's tree, or None if no parent exists.
         """
         if not commit.parents:
             return None
@@ -95,13 +116,37 @@ class RepoIndexer:
             return None  # shallow boundary: parent object is missing
 
     def _entries(self, repo, tree_sha):
-        """name -> (mode, sha) for one tree, non-recursive."""
+        """Reads non-recursive entries for a single tree object.
+
+        Args:
+            repo (Repo): An open Dulwich repository object.
+            tree_sha (bytes | None): SHA of the tree to inspect.
+
+        Returns:
+            dict[bytes, tuple[int, bytes]]: Mapping of `entry_name -> (mode, sha)`.
+                Returns an empty dictionary if `tree_sha` is None.
+        """
         if tree_sha is None:
             return {}
         return {name: (mode, sha) for name, mode, sha in repo[tree_sha].iteritems()}
 
     def _diff_trees(self, repo, old_sha, new_sha, prefix: bytes):
-        """Yield (path, blob_sha | DELETED) for everything that differs."""
+        """Recursively diffs two Git trees and yields changes as deltas.
+
+        Yields `(filepath, blob_sha)` for added or modified files, and
+        `(filepath, DELETED)` for files or directory subtrees that were removed.
+        If a subtree's SHA is identical between parent and child, it prunes recursion
+        immediately because subtrees with matching SHAs have identical contents.
+
+        Args:
+            repo (Repo): An open Dulwich repository object.
+            old_sha (bytes | None): SHA of the parent tree (None for root commits).
+            new_sha (bytes | None): SHA of the current commit's tree.
+            prefix (bytes): Path prefix accumulated during recursive descent.
+
+        Yields:
+            tuple[bytes, bytes | None]: (filepath, blob_sha | DELETED)
+        """
         # the whole point: identical sha => identical contents, prune here
         if old_sha == new_sha:
             return
@@ -146,7 +191,19 @@ class RepoIndexer:
                 yield (prefix + name, DELETED)
 
     def _flatten(self, repo, tree_sha, prefix: bytes):
-        """Every (path, blob_sha) under a tree. Memoised on tree sha."""
+        """Flattens a tree into a list of every (relative_path, blob_sha) under it.
+
+        Memoized by `tree_sha` in `self.tree_cache` so that unchanged subtrees across
+        commits and directory deletion tombstones avoid redundant disk traversals.
+
+        Args:
+            repo (Repo): An open Dulwich repository object.
+            tree_sha (bytes): SHA of the Git tree to flatten.
+            prefix (bytes): Prefix path to prepend to all flattened relative paths.
+
+        Returns:
+            list[tuple[bytes, bytes]]: List of `(path, blob_sha)` for all blobs in tree.
+        """
         cached = self.tree_cache.get(tree_sha)
         if cached is None:
             cached = []
@@ -165,7 +222,16 @@ class RepoIndexer:
     # --- reads: answered by git, not by replaying deltas -------------------
 
     def get_repo(self, path):
-        """Open a repo once and keep the handle; reads need it live."""
+        """Opens a Git repo once and keeps the handle; reads need it live.
+
+        Normalizes the path with `os.path.realpath` to ensure unique handles per repo.
+
+        Args:
+            path (str): File system path to the Git repository.
+
+        Returns:
+            Repo: Open Dulwich repository instance.
+        """
         key = os.path.realpath(path)
         repo = self.repos.get(key)
         if repo is None:
@@ -174,6 +240,17 @@ class RepoIndexer:
         return repo
 
     def _repo_for(self, commit_sha):
+        """Looks up the open Repo handle associated with a given commit SHA.
+
+        Args:
+            commit_sha (bytes): 40-character commit SHA.
+
+        Returns:
+            Repo: Open Dulwich repository containing this commit.
+
+        Raises:
+            KeyError: If the commit SHA was never indexed.
+        """
         path = self.commit_repo.get(commit_sha)
         if path is None:
             raise KeyError(f"commit {commit_sha!r} is not in the index")
@@ -185,6 +262,13 @@ class RepoIndexer:
         The commit's root tree already IS the snapshot, so this is one
         traversal of that tree. Memoised per tree sha, so commits that share
         subtrees share the work.
+
+        Args:
+            commit_sha (bytes | str): The commit SHA to snapshot.
+            repo_path (str, optional): Repository path (inferred from commit if omitted).
+
+        Returns:
+            dict[bytes, bytes]: Map of all active file paths to blob SHAs at that commit.
         """
         if isinstance(commit_sha, str):
             commit_sha = commit_sha.encode()
@@ -194,9 +278,17 @@ class RepoIndexer:
         return dict(self._flatten(repo, tree_sha, b""))
 
     def blob_at(self, commit_sha, filepath, repo_path=None):
-        """blob_sha for one path at one commit, or DELETED if absent.
+        """Retrieves the blob SHA for one path at one commit, or DELETED if absent.
 
         Walks only the trees along the path -- O(depth), not O(repo).
+
+        Args:
+            commit_sha (bytes | str): The commit SHA to inspect.
+            filepath (bytes | str): Relative path to the file.
+            repo_path (str, optional): Repository path (inferred from commit if omitted).
+
+        Returns:
+            bytes | None: Blob SHA if file exists, or DELETED (None) if absent / directory.
         """
         if isinstance(commit_sha, str):
             commit_sha = commit_sha.encode()
@@ -229,22 +321,47 @@ class RepoIndexer:
     # --- reads answered by the delta index ---------------------------------
 
     def changes_to(self, filepath, repo_path=None):
-        """[(commit_sha, blob_sha | DELETED)] for commits where this changed.
+        """[(commit_sha, blob_sha | DELETED)] for commits where this path changed.
 
         In ingestion order, which get_walker() gives roughly newest-first --
         it is date order, not a strict chain. repo_path may be omitted only
         while a single repo is indexed.
+
+        Args:
+            filepath (bytes | str): Relative file path to query.
+            repo_path (str, optional): Repository path (required if multiple repos indexed).
+
+        Returns:
+            list[tuple[bytes, bytes | None]]: List of (commit_sha, blob_sha | DELETED) pairs.
         """
         if isinstance(filepath, str):
             filepath = filepath.encode()
         return self.path_changes.get((self._one_repo(repo_path), filepath), [])
 
     def paths(self, repo_path=None):
-        """Every path this repo's index has ever seen."""
+        """Every path this repo's index has ever seen.
+
+        Args:
+            repo_path (str, optional): Repository path (required if multiple repos indexed).
+
+        Returns:
+            list[bytes]: List of unique relative file paths ever indexed for the repository.
+        """
         key = self._one_repo(repo_path)
         return [p for (r, p) in self.path_changes if r == key]
 
     def _one_repo(self, repo_path):
+        """Resolves the canonical repository path when optional in single-repo setups.
+
+        Args:
+            repo_path (str | None): Explicit repo path, or None to auto-detect.
+
+        Returns:
+            str: Canonical real path of the repository.
+
+        Raises:
+            ValueError: If repo_path is omitted and multiple repos have been indexed.
+        """
         if repo_path is not None:
             return os.path.realpath(repo_path)
         if len(self.indexed_repos) == 1:
@@ -254,6 +371,7 @@ class RepoIndexer:
         )
 
     def close(self):
+        """Closes all open repository handles and clears internal repo caches."""
         for repo in self.repos.values():
             repo.close()
         self.repos.clear()

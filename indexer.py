@@ -114,8 +114,8 @@ class Indexer:
 
         for name, (mode, sha) in new.items():
             was = old.get(name)
-            if was == (mode, sha):
-                continue  # unchanged file, or unchanged subtree
+            if was and was[1] == sha:
+                continue  # same object: unchanged file/subtree, or mode-only change
             path = prefix + name
 
             if mode == MODE_TREE:

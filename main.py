@@ -8,7 +8,7 @@ import sys
 
 from indexer import Indexer
 from reader import Reader
-from store import DELETED, Store
+from store import DELETED, Store, canonical
 
 REPO = "physics_engine.git"
 
@@ -77,6 +77,9 @@ class Harness:
         self.indexer = Indexer(self.store)
         self.reader = Reader(self.store)
         self.indexer.index_repo(path)
+        # every read names this repo explicitly -- other indexed repos may
+        # share commit shas with it (forks, clones)
+        self.repo_path = canonical(path)
         self.repo = self.store.get_repo(path)
         self.head = self.repo.head()
 
@@ -100,7 +103,7 @@ class Harness:
         if ref is None or ref.upper() == "HEAD":
             return self.head
         want = ref.lower().encode()
-        hits = [c for c in self.store.commit_repo if c.startswith(want)]
+        hits = [c for c in self.store.commits_in(self.repo_path) if c.startswith(want)]
         if len(hits) == 1:
             return hits[0]
         if not hits:
@@ -116,7 +119,7 @@ class Harness:
             commit (str, optional): Commit reference or None (defaults to HEAD).
         """
         sha = self.resolve(commit)
-        snap = self.reader.snapshot_at(sha)
+        snap = self.reader.snapshot_at(sha, repo_path=self.repo_path)
         for path in sorted(snap):
             print(f"  {short(snap[path])}  {show(path)}")
         print(f"{len(snap)} files at {short(sha)}")
@@ -129,7 +132,7 @@ class Harness:
             commit (str, optional): Commit reference or None (defaults to HEAD).
         """
         sha = self.resolve(commit)
-        blob = self.reader.blob_at(sha, path)
+        blob = self.reader.blob_at(sha, path, repo_path=self.repo_path)
         if blob is DELETED:
             # V0 cannot tell apart absent / directory / submodule
             print(f"  {path} is not a file at {short(sha)}")
@@ -144,7 +147,7 @@ class Harness:
             commit (str, optional): Commit reference or None (defaults to HEAD).
         """
         sha = self.resolve(commit)
-        blob = self.reader.blob_at(sha, path)
+        blob = self.reader.blob_at(sha, path, repo_path=self.repo_path)
         if blob is DELETED:
             print(f"  {path} is not a file at {short(sha)}")
             return
@@ -156,7 +159,7 @@ class Harness:
         Args:
             path (str): Relative file path whose change history to look up.
         """
-        rows = self.reader.changes_to(path)
+        rows = self.reader.changes_to(path, repo_path=self.repo_path)
         if not rows:
             print(f"  no recorded changes to {path}")
             return
@@ -170,9 +173,9 @@ class Harness:
 
     def cmd_paths(self):
         """Command 'paths': lists all paths ever indexed and the count of commits touching each."""
-        rows = sorted(self.reader.paths())
+        rows = sorted(self.reader.paths(repo_path=self.repo_path))
         for path in rows:
-            n = len(self.reader.changes_to(path))
+            n = len(self.reader.changes_to(path, repo_path=self.repo_path))
             print(f"  {n:4}  {show(path)}")
         print(f"{len(rows)} paths")
 
@@ -188,9 +191,9 @@ class Harness:
     def cmd_stats(self):
         """Command 'stats': displays index size metrics and cache counts."""
         print(f"  repos indexed:  {len(self.store.indexed_repos)}")
-        print(f"  commits:        {len(self.store.commit_repo)}")
-        print(f"  delta entries:  {len(self.store.file_index)}")
-        print(f"  paths tracked:  {len(self.reader.paths())}")
+        print(f"  commits:        {len(self.store.commits_in(self.repo_path))}")
+        print(f"  delta entries:  {sum(1 for k in self.store.file_index if k[0] == self.repo_path)}")
+        print(f"  paths tracked:  {len(self.reader.paths(repo_path=self.repo_path))}")
         print(f"  trees cached:   {len(self.store.tree_cache)}")
 
 

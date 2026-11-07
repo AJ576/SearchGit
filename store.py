@@ -31,16 +31,20 @@ class Store:
 
     def __init__(self):
         """Initializes empty index tables, repo handles and tree cache."""
-        # (commit_sha, filepath) -> blob_sha, or DELETED
-        # only present when the path changed at that commit
+        # (repo_path, commit_sha, filepath) -> blob_sha, or DELETED
+        # only present when the path changed at that commit. keyed by repo
+        # because the same commit can diff differently in different copies
+        # (a shallow clone's boundary commit records every file)
         self.file_index = {}
         # (repo_path, filepath) -> [(commit_sha, blob_sha | DELETED), ...]
         # inverted view of file_index so "where did this path change?" is a
         # lookup, not a scan. keyed by repo too: two repos both having a
         # README.md must not end up sharing one history
         self.path_changes = {}
-        # commit_sha -> repo path, so a read knows which repo to ask
-        self.commit_repo = {}
+        # canonical repo path -> {commit shas indexed in it}. repo first, like
+        # every other table: forks, clones and mirrors share commit shas, so
+        # a commit sha alone does not identify which repo to read from
+        self.repo_commits = {}
         # canonical repo paths that have been fully indexed
         self.indexed_repos = set()
         # repo path -> open Repo. the read path needs live handles
@@ -66,16 +70,24 @@ class Store:
             self.repos[key] = repo
         return repo
 
-    def repo_for_commit(self, commit_sha: bytes) -> Repo:
-        """Looks up the open Repo that owns an indexed commit.
+    def repo_for_commit(self, commit_sha: bytes, repo_path: str | None = None) -> Repo:
+        """Looks up the open Repo to read an indexed commit from.
+
+        The repo is resolved first (given, or the only one indexed), then the
+        commit is checked against that repo -- never the other way round.
 
         Raises:
-            KeyError: If the commit SHA was never indexed.
+            ValueError: If repo_path is omitted and several repos are indexed.
+            KeyError: If the commit was never indexed in that repo.
         """
-        path = self.commit_repo.get(commit_sha)
-        if path is None:
-            raise KeyError(f"commit {commit_sha!r} is not in the index")
-        return self.get_repo(path)
+        key = self.one_repo(repo_path)
+        if commit_sha not in self.repo_commits.get(key, ()):
+            raise KeyError(f"commit {commit_sha!r} is not indexed in {key}")
+        return self.get_repo(key)
+
+    def commits_in(self, repo_key: str) -> frozenset[bytes]:
+        """Every indexed commit sha in this canonical repo path (a read-only copy)."""
+        return frozenset(self.repo_commits.get(repo_key, ()))
 
     def one_repo(self, repo_path: str | None = None) -> str:
         """Resolves a repo key, allowing it to be omitted while only one repo is indexed.
@@ -87,6 +99,8 @@ class Store:
             return canonical(repo_path)
         if len(self.indexed_repos) == 1:
             return next(iter(self.indexed_repos))
+        if not self.indexed_repos:
+            raise ValueError("no repos are fully indexed yet")
         raise ValueError(
             f"repo_path is required with {len(self.indexed_repos)} repos indexed"
         )
@@ -99,11 +113,11 @@ class Store:
 
     def add_commit(self, repo_key: str, commit_sha: bytes):
         """Records which repo a commit belongs to."""
-        self.commit_repo[commit_sha] = repo_key
+        self.repo_commits.setdefault(repo_key, set()).add(commit_sha)
 
     def add_delta(self, repo_key: str, commit_sha: bytes, filepath: bytes, blob_sha):
         """Records that `filepath` changed to `blob_sha` (or DELETED) at `commit_sha`."""
-        self.file_index[(commit_sha, filepath)] = blob_sha
+        self.file_index[(repo_key, commit_sha, filepath)] = blob_sha
         self.path_changes.setdefault((repo_key, filepath), []).append(
             (commit_sha, blob_sha)
         )

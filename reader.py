@@ -21,10 +21,8 @@ class Reader:
         self.store = store
 
     def _repo(self, commit_sha: bytes, repo_path):
-        """The repo to read from: the one given, else the one that owns the commit."""
-        if repo_path:
-            return self.store.get_repo(repo_path)
-        return self.store.repo_for_commit(commit_sha)
+        """The repo to read from: the one given, else the only one indexed; the commit must be in it."""
+        return self.store.repo_for_commit(commit_sha, repo_path)
 
     # --- reads answered by git ---------------------------------------------
 
@@ -33,7 +31,7 @@ class Reader:
 
         Args:
             commit_sha (bytes | str): The commit SHA to snapshot.
-            repo_path (str, optional): Repository path (inferred from commit if omitted).
+            repo_path (str, optional): Repository path (required if several repos are indexed).
         """
         commit_sha = _b(commit_sha)
         repo = self._repo(commit_sha, repo_path)
@@ -47,7 +45,7 @@ class Reader:
         Args:
             commit_sha (bytes | str): The commit SHA to inspect.
             filepath (bytes | str): Relative path to the file.
-            repo_path (str, optional): Repository path (inferred from commit if omitted).
+            repo_path (str, optional): Repository path (required if several repos are indexed).
         """
         commit_sha = _b(commit_sha)
         repo = self._repo(commit_sha, repo_path)

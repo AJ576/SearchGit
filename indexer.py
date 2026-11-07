@@ -1,6 +1,7 @@
 """Write path: walks a repo's commits and records per-commit file deltas in a Store."""
 
 from store import DELETED, MODE_SUBMODULE, MODE_TREE, Store, canonical
+from trigram import TrigramIndex
 
 
 class Indexer:
@@ -13,9 +14,10 @@ class Indexer:
     each blob is born and where it dies.
     """
 
-    def __init__(self, store: Store):
-        """Initializes the indexer over a shared Store."""
+    def __init__(self, store: Store, trigrams: TrigramIndex):
+        """Initializes the indexer over a shared Store and TrigramIndex."""
         self.store = store
+        self.trigrams = trigrams
 
     def index_repo(self, path: str):
         """Indexes every commit reachable from HEAD into the store.
@@ -42,7 +44,7 @@ class Indexer:
             commit = entry.commit
             sha = commit.id
 
-            self.store.add_commit(key, sha)
+            self.store.add_commit(key, sha, commit.commit_time)
             parent_tree = self._parent_tree(repo, commit)
 
             for filepath, blob_sha in self._diff_trees(
@@ -53,10 +55,22 @@ class Indexer:
 
             commit_count += 1
 
+        self._build_trigrams()
         self.store.mark_indexed(key)
         print(f"Repo read: {path}")
         print(f"  commits:       {commit_count}")
         print(f"  delta entries: {entry_count}")
+
+    def _build_trigrams(self):
+        """Runs every blob first seen since the last pass through the trigram index.
+
+        Blobs that can't be read are left out; binary or oversized ones are
+        recorded as skipped by the TrigramIndex itself.
+        """
+        for blob_id in self.store.take_pending():
+            data = self.store.read_blob(blob_id)
+            if data is not None:
+                self.trigrams.add(blob_id, data)
 
     def _parent_tree(self, repo, commit):
         """Finds the root tree SHA of a commit's first parent, or None.

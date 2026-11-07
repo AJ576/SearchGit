@@ -9,6 +9,7 @@ import sys
 from indexer import Indexer
 from reader import Reader
 from store import DELETED, Store, canonical
+from trigram import TrigramIndex
 
 REPO = "physics_engine.git"
 
@@ -74,8 +75,9 @@ class Harness:
             path (str): File system path to the Git repository to index.
         """
         self.store = Store()
-        self.indexer = Indexer(self.store)
-        self.reader = Reader(self.store)
+        self.trigrams = TrigramIndex()
+        self.indexer = Indexer(self.store, self.trigrams)
+        self.reader = Reader(self.store, self.trigrams)
         self.indexer.index_repo(path)
         # every read names this repo explicitly -- other indexed repos may
         # share commit shas with it (forks, clones)

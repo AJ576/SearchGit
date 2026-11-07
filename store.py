@@ -1,8 +1,9 @@
-"""Shared state for SearchGit: open repo handles, the delta index, the tree cache.
+"""Shared state for SearchGit: open repo handles, the delta index, blob tables, the tree cache.
 
-The store holds data and nothing else -- it does not decide what to index
-(that's the Indexer) or how to answer queries (that's the Reader). Both of
-those take a Store and work through it.
+The store holds the data and the low-level git reads both paths need
+(opening repos, flattening trees, reading blobs). It does not decide what
+to index (that's the Indexer) or how to answer queries (that's the Reader).
+Both of those take a Store and work through it.
 """
 
 import os
@@ -22,11 +23,14 @@ def canonical(path: str) -> str:
 
 
 class Store:
-    """In-memory delta index plus live git handles.
+    """In-memory delta index and blob tables, plus the git access both paths share.
 
     The delta index records a (commit, path) entry only where the blob at that
     path changed relative to the commit's first parent. It is an index, not a
-    source of truth -- full snapshots are read straight from git.
+    source of truth -- full snapshots and blob contents are read straight from
+    git, through the handles and helpers here (get_repo, flatten, read_blob).
+    The store does not decide what to index or how to answer queries; that's
+    the Indexer and the Reader.
     """
 
     def __init__(self):
@@ -51,6 +55,22 @@ class Store:
         self.repos = {}
         # tree_sha -> [(relative_path, blob_sha), ...]
         self.tree_cache = {}
+
+        # --- blob content tables, global across repos: identical content
+        # gets one id no matter how many repos, commits or paths hold it
+        # blob_sha -> int id
+        self.blob_ids = {}
+        # int id -> blob_sha
+        self.blob_shas = []
+        # int id -> canonical path of a repo the blob can be read from
+        self.blob_repo = {}
+        # new int ids not yet run through the trigram pass
+        self.pending = []
+        # blob_sha -> [(repo_path, commit_sha, filepath), ...] for every
+        # commit that wrote this blob to a path
+        self.blob_occurrences = {}
+        # (repo_path, commit_sha) -> commit time, unix seconds
+        self.commit_times = {}
 
     # --- repo handles ------------------------------------------------------
 
@@ -111,16 +131,62 @@ class Store:
         """True if this canonical repo path has already been indexed."""
         return repo_key in self.indexed_repos
 
-    def add_commit(self, repo_key: str, commit_sha: bytes):
+    def add_commit(self, repo_key: str, commit_sha: bytes, commit_time: int | None = None):
         """Records which repo a commit belongs to."""
         self.repo_commits.setdefault(repo_key, set()).add(commit_sha)
+        if commit_time is not None:
+            self.commit_times[(repo_key, commit_sha)] = commit_time
 
     def add_delta(self, repo_key: str, commit_sha: bytes, filepath: bytes, blob_sha):
-        """Records that `filepath` changed to `blob_sha` (or DELETED) at `commit_sha`."""
+        """Records that `filepath` changed to `blob_sha` (or DELETED) at `commit_sha`.
+
+        If blob_sha is not DELETED: assigns id if new (append to pending),
+        and ALWAYS appends occurrence to blob_occurrences.
+        """
         self.file_index[(repo_key, commit_sha, filepath)] = blob_sha
         self.path_changes.setdefault((repo_key, filepath), []).append(
             (commit_sha, blob_sha)
         )
+        if blob_sha is not DELETED:
+            self._blob_id(blob_sha, repo_key)
+            self.blob_occurrences.setdefault(blob_sha, []).append(
+                (repo_key, commit_sha, filepath)
+            )
+
+    def _blob_id(self, blob_sha: bytes, repo_key: str):
+        """Assigns an id to a blob seen for the first time; no-op if it has one.
+
+        A new id is queued in `pending` for the trigram pass, and remembers
+        `repo_key` as the repo to read the blob's contents from.
+        """
+        if blob_sha in self.blob_ids:
+            return
+        blob_id = len(self.blob_shas)
+        self.blob_ids[blob_sha] = blob_id
+        self.blob_shas.append(blob_sha)
+        self.pending.append(blob_id)
+        self.blob_repo[blob_id] = repo_key
+
+    def take_pending(self) -> list[int]:
+        """Return pending ids and clear the list."""
+        pending = self.pending
+        self.pending = []
+        return pending
+
+    def read_blob(self, blob_id: int) -> bytes | None:
+        """Raw contents of a blob, by id, read from git.
+
+        Returns:
+            bytes | None: The blob's bytes, or None if the id is unknown or the
+                blob is missing from the repo it was recorded in.
+        """
+        try:
+            repo_key = self.blob_repo[blob_id]
+            blob_sha = self.blob_shas[blob_id]
+            repo = self.get_repo(repo_key)
+            return repo[blob_sha].data
+        except (KeyError, IndexError):
+            return None
 
     def mark_indexed(self, repo_key: str):
         """Marks a repo as fully indexed."""

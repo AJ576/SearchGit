@@ -1,11 +1,32 @@
 """Read path: answers queries from git trees and from the Store's delta index."""
 
+from dataclasses import dataclass
+
 from store import DELETED, MODE_SUBMODULE, MODE_TREE, Store
+from trigram import TrigramIndex
 
 
 def _b(value) -> bytes:
     """Accepts str or bytes, returns bytes."""
     return value.encode() if isinstance(value, str) else value
+
+
+@dataclass
+class Occurrence:
+    repo: str
+    commit: bytes
+    path: bytes
+    commit_time: int | None
+
+
+@dataclass
+class Hit:
+    blob_sha: bytes
+    occurrences: list[Occurrence]      # oldest first
+
+    @property
+    def first_seen(self) -> Occurrence:
+        return self.occurrences[0]
 
 
 class Reader:
@@ -16,9 +37,10 @@ class Reader:
     come from the delta index in the Store.
     """
 
-    def __init__(self, store: Store):
-        """Initializes the reader over a shared Store."""
+    def __init__(self, store: Store, trigrams: TrigramIndex):
+        """Initializes the reader over a shared Store and TrigramIndex."""
         self.store = store
+        self.trigrams = trigrams
 
     def _repo(self, commit_sha: bytes, repo_path):
         """The repo to read from: the one given, else the only one indexed; the commit must be in it."""
@@ -85,3 +107,65 @@ class Reader:
         """Every path this repo's index has ever seen."""
         key = self.store.one_repo(repo_path)
         return [p for (r, p) in self.store.path_changes if r == key]
+
+    # --- reads answered by trigrams and store ------------------------------
+
+    def search(self, query, case_sensitive: bool = True) -> list[Hit]:
+        """Every blob, in any indexed repo and any commit, whose contents contain `query`.
+
+        Searches all history, not one snapshot: each version of a file that
+        matched is its own Hit. Each Hit lists where that blob was written
+        (oldest first), and hits are ordered by when they were first seen.
+        Commits with no recorded time sort last.
+
+        Args:
+            query (str | bytes): Literal text, at least 3 bytes.
+            case_sensitive (bool): If False, ASCII letters match either case.
+
+        Returns:
+            list[Hit]: Matching blobs, oldest first-seen first.
+
+        Raises:
+            ValueError: If the query is shorter than 3 bytes.
+        """
+        query_bytes = _b(query)
+        blob_ids = self.trigrams.search(
+            query_bytes, self.store.read_blob, case_sensitive=case_sensitive
+        )
+        hits = []
+        for blob_id in blob_ids:
+            blob_sha = self.store.blob_shas[blob_id]
+            raw_occs = self.store.blob_occurrences.get(blob_sha, [])
+            occurrences = [
+                Occurrence(
+                    repo=repo,
+                    commit=commit,
+                    path=path,
+                    commit_time=self.store.commit_times.get((repo, commit)),
+                )
+                for repo, commit, path in raw_occs
+            ]
+            occurrences.sort(
+                key=lambda occ: (
+                    occ.commit_time
+                    if occ.commit_time is not None
+                    else float("inf")
+                )
+            )
+            hits.append(Hit(blob_sha=blob_sha, occurrences=occurrences))
+
+        hits.sort(
+            key=lambda hit: (
+                hit.first_seen.commit_time
+                if hit.first_seen.commit_time is not None
+                else float("inf")
+            )
+        )
+        return hits
+
+    def read(self, blob_sha: bytes) -> bytes | None:
+        """Full file text for a blob sha."""
+        blob_id = self.store.blob_ids.get(_b(blob_sha))
+        if blob_id is None:
+            return None
+        return self.store.read_blob(blob_id)

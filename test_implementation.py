@@ -1,6 +1,9 @@
+import os
+import tempfile
 import pytest
 from pyroaring import BitMap
 
+from db import Database
 from trigram import MAX_BLOB, TrigramIndex, extract, is_indexable
 from store import DELETED, Store, canonical
 from indexer import Indexer
@@ -307,3 +310,147 @@ class TestIntegrationWithPhysicsEngine:
         assert reader.read(head_commit_sha) is None
         assert reader.read(root_tree_sha) is None
         assert reader.read(b"nonexistent_sha_000000000000000000000000") is None
+
+
+class TestDatabase:
+    def test_database_init_and_schema(self):
+        db = Database(":memory:")
+        assert db.get_indexed_repos() == set()
+        assert db.get_delta_count() == 0
+        assert db.get_commit_count() == 0
+        db.close()
+
+    def test_database_repo_and_commits(self):
+        db = Database(":memory:")
+        db.record_repo("/path/to/repo.git")
+        assert db.is_repo_indexed("/path/to/repo.git") is True
+        assert db.is_repo_indexed("/path/to/other.git") is False
+        assert db.get_indexed_repos() == {"/path/to/repo.git"}
+
+        db.record_commit("/path/to/repo.git", b"c1", 1000)
+        db.record_commit("/path/to/repo.git", b"c2", 2000)
+        assert db.get_all_commits_in("/path/to/repo.git") == {b"c1", b"c2"}
+        assert db.get_all_commit_times() == {
+            ("/path/to/repo.git", b"c1"): 1000,
+            ("/path/to/repo.git", b"c2"): 2000,
+        }
+        assert db.get_repo_for_commit(b"c1") == "/path/to/repo.git"
+
+        db.clear_repo("/path/to/repo.git")
+        assert db.is_repo_indexed("/path/to/repo.git") is False
+        assert db.get_all_commits_in("/path/to/repo.git") == set()
+        db.close()
+
+    def test_database_blobs_and_deltas(self):
+        db = Database(":memory:")
+        db.record_repo("repo1")
+        db.record_commit("repo1", b"c1", 100)
+        db.record_blob(0, b"blob_sha_0", "repo1")
+        db.record_blob(1, b"blob_sha_1", "repo1")
+
+        blob_ids, blob_shas, blob_repo = db.get_all_blobs()
+        assert blob_ids == {b"blob_sha_0": 0, b"blob_sha_1": 1}
+        assert blob_shas == [b"blob_sha_0", b"blob_sha_1"]
+        assert blob_repo == {0: "repo1", 1: "repo1"}
+
+        db.insert_delta("repo1", b"c1", b"main.py", b"blob_sha_0")
+        db.insert_delta("repo1", b"c1", b"util.py", None)  # DELETED
+        assert db.get_delta_count("repo1") == 2
+        assert set(db.get_paths("repo1")) == {b"main.py", b"util.py"}
+        assert db.get_history("repo1", b"main.py") == [(b"c1", b"blob_sha_0")]
+        assert db.get_history("repo1", b"util.py") == [(b"c1", None)]
+        assert db.get_blob_occurrences(b"blob_sha_0") == [("repo1", b"c1", b"main.py")]
+        db.close()
+
+    def test_database_trigram_bitmaps(self):
+        db = Database(":memory:")
+        postings = {
+            b"abc": BitMap([1, 2, 3]),
+            b"xyz": BitMap([2, 5]),
+        }
+        indexed = BitMap([1, 2, 3, 5])
+        skipped = BitMap([4, 6])
+        db.save_trigrams(postings, indexed, skipped)
+
+        loaded_postings, loaded_indexed, loaded_skipped = db.load_trigrams()
+        assert set(loaded_postings.keys()) == {b"abc", b"xyz"}
+        assert list(loaded_postings[b"abc"]) == [1, 2, 3]
+        assert list(loaded_postings[b"xyz"]) == [2, 5]
+        assert list(loaded_indexed) == [1, 2, 3, 5]
+        assert list(loaded_skipped) == [4, 6]
+        db.close()
+
+
+class TestPersistence:
+    def test_full_persistence_and_reload(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test_searchgit.db")
+
+            # 1. Index physics_engine.git with persistent database
+            store1 = Store(db_path=db_path)
+            trigrams1 = TrigramIndex(db=store1.db)
+            indexer1 = Indexer(store1, trigrams1)
+            reader1 = Reader(store1, trigrams1)
+
+            repo_path = "physics_engine.git"
+            indexer1.index_repo(repo_path)
+
+            key = canonical(repo_path)
+            assert store1.is_indexed(key)
+            hits1 = reader1.search("Vector")
+            assert len(hits1) > 0
+            changes1 = reader1.changes_to("physics.cpp")
+            assert len(changes1) > 0
+            paths1 = sorted(reader1.paths())
+            assert len(paths1) > 0
+
+            commits_expected = store1.commits_in(key)
+            blob_ids_expected = len(store1.blob_ids)
+            indexed_expected = len(trigrams1.indexed)
+            postings_expected = len(trigrams1.postings)
+
+            # Close store and connection
+            store1.close()
+
+            # 2. Open fresh Store and TrigramIndex pointing to the same db_path
+            store2 = Store(db_path=db_path)
+            trigrams2 = TrigramIndex(db=store2.db)
+            reader2 = Reader(store2, trigrams2)
+            indexer2 = Indexer(store2, trigrams2)
+
+            # Assert repo is already recognized as indexed
+            assert store2.is_indexed(key)
+
+            # Re-indexing should be a no-op
+            indexer2.index_repo(repo_path)
+
+            # Metadata should match
+            assert store2.commits_in(key) == commits_expected
+            assert len(store2.blob_ids) == blob_ids_expected
+            assert len(trigrams2.indexed) == indexed_expected
+            assert len(trigrams2.postings) == postings_expected
+
+            # Queries should return identical results
+            hits2 = reader2.search("Vector")
+            assert len(hits2) == len(hits1)
+            for h1, h2 in zip(hits1, hits2):
+                assert h1.blob_sha == h2.blob_sha
+                assert len(h1.occurrences) == len(h2.occurrences)
+                for o1, o2 in zip(h1.occurrences, h2.occurrences):
+                    assert o1.commit == o2.commit
+                    assert o1.path == o2.path
+                    assert o1.commit_time == o2.commit_time
+
+            changes2 = reader2.changes_to("physics.cpp")
+            assert changes2 == changes1
+
+            paths2 = sorted(reader2.paths())
+            assert paths2 == paths1
+
+            # Read file text straight from git packfile via restored blob mapping
+            first_blob = hits2[0].blob_sha
+            content = reader2.read(first_blob)
+            assert content is not None
+            assert b"Vector" in content or b"vector" in content
+
+            store2.close()

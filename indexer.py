@@ -71,6 +71,7 @@ class Indexer:
             data = self.store.read_blob(blob_id)
             if data is not None:
                 self.trigrams.add(blob_id, data)
+        self.trigrams.save()
 
     def _parent_tree(self, repo, commit):
         """Finds the root tree SHA of a commit's first parent, or None.

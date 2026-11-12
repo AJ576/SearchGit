@@ -75,17 +75,25 @@ def when(occ):
 class Harness:
     """Console test harness that provides interactive commands over the index."""
 
-    def __init__(self, paths):
+    def __init__(self, paths, db_path="searchgit.db"):
         """Indexes every repo in `paths` into one shared store; first is current."""
-        self.store = Store()
-        self.trigrams = TrigramIndex()
+        self.store = Store(db_path=db_path)
+        self.trigrams = TrigramIndex(db=self.store.db)
         self.indexer = Indexer(self.store, self.trigrams)
         self.reader = Reader(self.store, self.trigrams)
 
         self.names = {}  # display name -> canonical repo path
+        for key in self.store.indexed_repos:
+            base = os.path.basename(key.rstrip("/")) or key
+            name, n = base, 2
+            while name in self.names:
+                name, n = f"{base}-{n}", n + 1
+            self.names[name] = key
+
         for path in paths:
             key = canonical(path)
             if key in self.names.values():
+                print(f"Repo loaded from index: {path}")
                 continue
             self.indexer.index_repo(path)
             base = os.path.basename(key.rstrip("/")) or key

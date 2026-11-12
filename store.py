@@ -9,6 +9,7 @@ Both of those take a Store and work through it.
 import os
 
 from dulwich.repo import Repo
+from db import Database
 
 # git object modes (octal in git, ints here)
 MODE_TREE = 0o040000       # 16384 -> directory / subtree
@@ -33,8 +34,15 @@ class Store:
     the Indexer and the Reader.
     """
 
-    def __init__(self):
-        """Initializes empty index tables, repo handles and tree cache."""
+    def __init__(self, db: Database | None = None, db_path: str | None = None):
+        """Initializes empty index tables, repo handles, tree cache, and optional SQLite DB."""
+        if db is not None:
+            self.db = db
+        elif db_path is not None:
+            self.db = Database(db_path)
+        else:
+            self.db = None
+
         # (repo_path, commit_sha, filepath) -> blob_sha, or DELETED
         # only present when the path changed at that commit. keyed by repo
         # because the same commit can diff differently in different copies
@@ -71,6 +79,29 @@ class Store:
         self.blob_occurrences = {}
         # (repo_path, commit_sha) -> commit time, unix seconds
         self.commit_times = {}
+
+        if self.db is not None:
+            self._load_from_db()
+
+    def _load_from_db(self):
+        """Restores indexed state, commits, blobs, and deltas from SQLite."""
+        self.indexed_repos = self.db.get_indexed_repos()
+        for repo_key in self.indexed_repos:
+            self.repo_commits[repo_key] = self.db.get_all_commits_in(repo_key)
+        self.commit_times.update(self.db.get_all_commit_times())
+
+        blob_ids, blob_shas, blob_repo = self.db.get_all_blobs()
+        self.blob_ids.update(blob_ids)
+        self.blob_shas = blob_shas
+        self.blob_repo.update(blob_repo)
+
+        path_changes = self.db.get_all_path_changes()
+        self.path_changes.update(path_changes)
+        for (repo_key, filepath), changes in path_changes.items():
+            for commit_sha, blob_sha in changes:
+                self.file_index[(repo_key, commit_sha, filepath)] = blob_sha
+
+        self.blob_occurrences.update(self.db.get_all_blob_occurrences())
 
     # --- repo handles ------------------------------------------------------
 
@@ -136,6 +167,8 @@ class Store:
         self.repo_commits.setdefault(repo_key, set()).add(commit_sha)
         if commit_time is not None:
             self.commit_times[(repo_key, commit_sha)] = commit_time
+        if self.db is not None:
+            self.db.record_commit(repo_key, commit_sha, commit_time)
 
     def add_delta(self, repo_key: str, commit_sha: bytes, filepath: bytes, blob_sha):
         """Records that `filepath` changed to `blob_sha` (or DELETED) at `commit_sha`.
@@ -152,6 +185,8 @@ class Store:
             self.blob_occurrences.setdefault(blob_sha, []).append(
                 (repo_key, commit_sha, filepath)
             )
+        if self.db is not None:
+            self.db.insert_delta(repo_key, commit_sha, filepath, blob_sha)
 
     def _blob_id(self, blob_sha: bytes, repo_key: str):
         """Assigns an id to a blob seen for the first time; no-op if it has one.
@@ -166,6 +201,8 @@ class Store:
         self.blob_shas.append(blob_sha)
         self.pending.append(blob_id)
         self.blob_repo[blob_id] = repo_key
+        if self.db is not None:
+            self.db.record_blob(blob_id, blob_sha, repo_key)
 
     def take_pending(self) -> list[int]:
         """Return pending ids and clear the list."""
@@ -191,6 +228,9 @@ class Store:
     def mark_indexed(self, repo_key: str):
         """Marks a repo as fully indexed."""
         self.indexed_repos.add(repo_key)
+        if self.db is not None:
+            self.db.record_repo(repo_key)
+            self.db.commit()
 
     # --- git tree helpers (shared by indexer and reader) -------------------
 
@@ -225,7 +265,9 @@ class Store:
         return [(prefix + p, sha) for p, sha in cached]
 
     def close(self):
-        """Closes all open repository handles."""
+        """Closes all open repository handles and the database connection."""
         for repo in self.repos.values():
             repo.close()
         self.repos.clear()
+        if self.db is not None:
+            self.db.close()

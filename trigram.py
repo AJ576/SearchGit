@@ -36,11 +36,29 @@ class TrigramIndex:
     indexed: BitMap                # ids trigrammed
     skipped: BitMap                # ids seen but not indexable
 
-    def __init__(self):
-        """Initializes empty postings and tracking bitmaps."""
+    def __init__(self, db=None):
+        """Initializes empty postings and tracking bitmaps, loading from db if provided."""
+        self.db = db
         self.postings = {}
         self.indexed = BitMap()
         self.skipped = BitMap()
+        if self.db is not None:
+            self.load()
+
+    def save(self, db=None):
+        """Persists postings, indexed, and skipped bitmaps to db."""
+        target_db = db or self.db
+        if target_db is not None:
+            target_db.save_trigrams(self.postings, self.indexed, self.skipped)
+
+    def load(self, db=None):
+        """Loads postings, indexed, and skipped bitmaps from db."""
+        target_db = db or self.db
+        if target_db is not None:
+            postings, indexed, skipped = target_db.load_trigrams()
+            self.postings.update(postings)
+            self.indexed |= indexed
+            self.skipped |= skipped
 
     def add(self, blob_id: int, data: bytes) -> bool:
         """Index one blob. Return False if skipped (not indexable)."""

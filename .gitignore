@@ -8,6 +8,8 @@ corpus/
 *.sqlite
 *.sqlite3
 *.db
+*.db-shm
+*.db-wal
 index/
 *.trigrams
 *.bitmap
